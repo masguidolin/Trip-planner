@@ -68,7 +68,20 @@
       (user) => {
         if (user) {
           window.__connDebug.authOk = true;
-          resolve(user);
+          window.__connDebug.uid = user.uid;
+          window.__connDebug.isAnonymous = user.isAnonymous;
+          user.getIdToken(true).then(
+            (token) => {
+              window.__connDebug.tokenOk = true;
+              window.__connDebug.tokenLen = token ? token.length : 0;
+              resolve(user);
+            },
+            (err) => {
+              window.__connDebug.tokenOk = false;
+              window.__connDebug.tokenError = (err && err.code ? err.code + ": " : "") + (err && err.message ? err.message : String(err));
+              resolve(user); // proseguiamo comunque per vedere l'errore Firestore
+            }
+          );
         } else {
           auth.signInAnonymously().catch((err) => {
             window.__connDebug.authError = (err && err.code ? err.code + ": " : "") + (err && err.message ? err.message : String(err));
@@ -83,6 +96,7 @@
     );
   });
 </script>
+
 
 <script type="text/babel-source" id="app-source">
 const { useState, useEffect, useCallback } = React;
@@ -217,11 +231,13 @@ function TripPlanner() {
   const defaultNewDate = flightOut.date ? addDays(flightOut.date, 1) : "";
 
   const [connError, setConnError] = useState(null);
+  const [, forceDebugRefresh] = useState(0);
 
   useEffect(() => {
     (async () => {
       try {
         await window.__authReady;
+        forceDebugRefresh((n) => n + 1);
       } catch (e) {
         setConnError("Autenticazione Firebase fallita: " + (window.__connDebug.authError || e.message || String(e)));
         setLoaded(true);
@@ -570,6 +586,9 @@ function TripPlanner() {
         />
 
         <div style={styles.footer}>Dati salvati automaticamente sul dispositivo</div>
+        <div style={styles.debugLine}>
+          debug — uid: {window.__connDebug?.uid || "nessuno"} · anon: {String(window.__connDebug?.isAnonymous)} · token: {window.__connDebug?.tokenOk === true ? "ok" : (window.__connDebug?.tokenError || "n/d")}
+        </div>
 
         <button style={styles.exportBtn} onClick={exportPdf}>
           <StickyNote size={13} /> Esporta PDF del viaggio
@@ -1123,6 +1142,7 @@ const styles = {
   emptyTitle: { fontWeight: 600, color: "#4B5563", marginBottom: 2 },
   emptyText: { fontSize: 12.5, maxWidth: 340 },
   footer: { textAlign: "center", fontSize: 11, color: "#A3A08F", marginTop: 24 },
+  debugLine: { textAlign: "center", fontSize: 9.5, color: "#B8B2A0", marginTop: 6, fontFamily: "'JetBrains Mono', monospace" },
   errorBanner: {
     background: "#FDECEA", border: "1px solid #E9A7A0", color: "#8C2F26",
     borderRadius: 10, padding: "10px 12px", fontSize: 12, marginBottom: 14,
