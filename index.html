@@ -1,0 +1,1134 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Diario di viaggio</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" />
+
+<!-- React + Babel (nessuna build necessaria, va bene per GitHub Pages) -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/lucide-react@0.383.0/dist/umd/lucide-react.js"></script>
+
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+<style>
+  body { margin: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // ============================================================
+  // CONFIGURAZIONE FIREBASE — sostituisci con i valori del TUO
+  // nuovo progetto Firebase (Project settings > General > la tua
+  // web app > Config). Sono valori pubblici lato client: la
+  // sicurezza vera è nelle regole di Firestore, non nel nasconderli.
+  // ============================================================
+  const firebaseConfig = {
+    apiKey: "AIzaSyA3rNXyOKGKvDeW5m96S5Ed7r-3kJ3n2e4",
+    authDomain: "trip-plaaner-eac5c.firebaseapp.com",
+    projectId: "trip-plaaner-eac5c",
+    storageBucket: "trip-plaaner-eac5c.firebasestorage.app",
+    messagingSenderId: "796133832787",
+    appId: "1:796133832787:web:8cefc4fd4b59f48b9d6ea6"
+  };
+
+  firebase.initializeApp(firebaseConfig);
+  const auth = firebase.auth();
+  const db = firebase.firestore();
+
+  const DOC_REF = () => db.collection("tripplanner").doc("main");
+
+  // Storage adapter con la stessa interfaccia usata nell'artifact
+  // (get/set su una singola chiave), ma sostenuta da Firestore.
+  window.storage = {
+    async get(key) {
+      const snap = await DOC_REF().get();
+      if (!snap.exists) return null;
+      const data = snap.data();
+      if (!(key in data)) return null;
+      return { key, value: data[key], shared: false };
+    },
+    async set(key, value) {
+      await DOC_REF().set({ [key]: value }, { merge: true });
+      return { key, value, shared: false };
+    },
+  };
+
+  window.__authReady = new Promise((resolve) => {
+    auth.onAuthStateChanged((user) => {
+      if (user) resolve(user);
+      else auth.signInAnonymously().catch(console.error);
+    });
+  });
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback } = React;
+const {
+  Plane, Bed, MapPin, Link: LinkIcon, StickyNote, Plus, Trash2,
+  Pencil, Check, KeyRound, Wallet, Navigation, Compass, Minus,
+  ArrowRightLeft, Clock, X
+} = lucideReact;
+
+const STORAGE_KEY = "trip-planner-v2";
+
+const emptyNightDraft = () => ({
+  checkIn: "",
+  nights: 1,
+  hotel: "",
+  location: "",
+  confirmation: "",
+  pin: "",
+  paid: false,
+  cancelInfo: "",
+  link: "",
+  address: "",
+});
+
+const emptyActivity = () => ({
+  id: crypto.randomUUID(),
+  type: "activity",
+  date: "",
+  time: "",
+  title: "",
+  notes: "",
+  location: "",
+  link: "",
+});
+
+const emptyTransport = () => ({
+  id: crypto.randomUUID(),
+  type: "transport",
+  date: "",
+  startTime: "",
+  endTime: "",
+  mode: "",
+  from: "",
+  to: "",
+  notes: "",
+  link: "",
+});
+
+const emptyFlight = () => ({ date: "", depTime: "", arrTime: "", from: "", to: "" });
+
+const MONTHS_IT = ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"];
+
+// Costruisce/manipola le date usando solo componenti locali (anno/mese/giorno),
+// senza mai passare per toISOString/UTC, per evitare lo sfasamento di un giorno.
+function parseLocalDate(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+function toDateStr(d) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+function addDays(dateStr, n) {
+  const d = parseLocalDate(dateStr);
+  d.setDate(d.getDate() + n);
+  return toDateStr(d);
+}
+
+function fmtDate(d) {
+  if (!d) return "—";
+  const parts = d.split("-");
+  if (parts.length !== 3) return d;
+  const [, m, day] = parts;
+  const w = parseLocalDate(d).toLocaleDateString("it-IT", { weekday: "short" });
+  return `${day}/${m} · ${w}`;
+}
+
+// Per un pernottamento mostra l'intervallo notte, es. "20-21 dic" (o "31 dic - 1 gen" a cavallo di mese)
+function fmtNightRange(dateStr) {
+  if (!dateStr) return "—";
+  const start = parseLocalDate(dateStr);
+  const end = parseLocalDate(dateStr);
+  end.setDate(end.getDate() + 1);
+  const startDay = start.getDate();
+  const endDay = end.getDate();
+  if (start.getMonth() === end.getMonth()) {
+    return `${startDay}-${endDay} ${MONTHS_IT[end.getMonth()]}`;
+  }
+  return `${startDay} ${MONTHS_IT[start.getMonth()]} - ${endDay} ${MONTHS_IT[end.getMonth()]}`;
+}
+
+function TripPlanner() {
+  const [tripName, setTripName] = useState("Il mio viaggio");
+  const [flightOut, setFlightOut] = useState(emptyFlight());
+  const [flightIn, setFlightIn] = useState(emptyFlight());
+  const [items, setItems] = useState([]); // mix di {type:'night',...} e {type:'activity',...}
+  const [loaded, setLoaded] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [viewingId, setViewingId] = useState(null);
+  const [saveState, setSaveState] = useState("idle");
+  const [editingFlight, setEditingFlight] = useState(null);
+  const [nameEditing, setNameEditing] = useState(false);
+  const [addMode, setAddMode] = useState(null); // 'night' | null
+  const [nightDraft, setNightDraft] = useState(emptyNightDraft());
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleteInput, setDeleteInput] = useState("");
+
+  const defaultNewDate = flightOut.date ? addDays(flightOut.date, 1) : "";
+
+  useEffect(() => {
+    (async () => {
+      await window.__authReady;
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        if (res && res.value) {
+          const data = JSON.parse(res.value);
+          setTripName(data.tripName ?? "Il mio viaggio");
+          setFlightOut(data.flightOut ?? emptyFlight());
+          setFlightIn(data.flightIn ?? emptyFlight());
+          setItems(Array.isArray(data.items) ? data.items : []);
+        }
+      } catch (e) {
+        // nessun dato salvato ancora
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  const persist = useCallback(async (next) => {
+    setSaveState("saving");
+    try {
+      await window.storage.set(STORAGE_KEY, JSON.stringify(next), false);
+      setSaveState("saved");
+      setTimeout(() => setSaveState("idle"), 1200);
+    } catch (e) {
+      setSaveState("idle");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    persist({ tripName, flightOut, flightIn, items });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tripName, flightOut, flightIn, items, loaded]);
+
+  function sortTime(item) {
+    if (item.type === "night") return "99:99"; // il pernottamento chiude sempre la giornata
+    return item.type === "transport" ? (item.startTime || "00:00") : (item.time || "00:00");
+  }
+  const sorted = [...items].sort((a, b) => {
+    const c = (a.date || "9999").localeCompare(b.date || "9999");
+    if (c !== 0) return c;
+    return sortTime(a).localeCompare(sortTime(b));
+  });
+
+  function updateItem(id, patch) {
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+  }
+  function removeItem(id) {
+    setItems((prev) => prev.filter((it) => it.id !== id));
+    setEditingId(null);
+  }
+  function commitNightDraft() {
+    const d = nightDraft;
+    if (!d.checkIn) return;
+    const n = Math.max(1, Number(d.nights) || 1);
+    const created = Array.from({ length: n }).map((_, i) => ({
+      id: crypto.randomUUID(),
+      type: "night",
+      date: addDays(d.checkIn, i),
+      hotel: d.hotel,
+      location: d.location,
+      confirmation: d.confirmation,
+      pin: d.pin,
+      paid: d.paid,
+      cancelInfo: d.cancelInfo,
+      link: d.link,
+      address: d.address,
+    }));
+    setItems((prev) => [...prev, ...created]);
+    setNightDraft(emptyNightDraft());
+    setAddMode(null);
+  }
+  function addActivity() {
+    const a = emptyActivity();
+    a.date = defaultNewDate;
+    setItems((prev) => [...prev, a]);
+    setEditingId(a.id);
+    setAddMode(null);
+  }
+  function addTransport() {
+    const t = emptyTransport();
+    t.date = defaultNewDate;
+    setItems((prev) => [...prev, t]);
+    setEditingId(t.id);
+    setAddMode(null);
+  }
+  function openNightAddForm() {
+    setNightDraft((d) => ({ ...d, checkIn: d.checkIn || defaultNewDate }));
+    setAddMode("night");
+  }
+  function buildTripSummaryHTML() {
+    const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const rows = sorted.map((item) => {
+      if (item.type === "night") {
+        return `
+          <div class="entry entry-night">
+            <div class="entry-date">${esc(fmtNightRange(item.date))}</div>
+            <div class="entry-body">
+              <div class="entry-title">🛏 ${esc(item.hotel || "Struttura")}</div>
+              ${item.location ? `<div class="entry-sub">${esc(item.location)}</div>` : ""}
+              <table class="meta">
+                ${item.confirmation ? `<tr><td>Conferma</td><td>${esc(item.confirmation)}</td></tr>` : ""}
+                ${item.pin ? `<tr><td>PIN</td><td>${esc(item.pin)}</td></tr>` : ""}
+                <tr><td>Pagato</td><td>${item.paid ? "Sì" : "No"}</td></tr>
+                ${item.cancelInfo ? `<tr><td>Cancellazione</td><td>${esc(item.cancelInfo)}</td></tr>` : ""}
+                ${item.address ? `<tr><td>Indirizzo</td><td>${esc(item.address)}</td></tr>` : ""}
+                ${item.link ? `<tr><td>Link</td><td>${esc(item.link)}</td></tr>` : ""}
+              </table>
+            </div>
+          </div>`;
+      }
+      if (item.type === "transport") {
+        const time = [item.startTime, item.endTime].filter(Boolean).join(" – ");
+        return `
+          <div class="entry entry-transport">
+            <div class="entry-date">${esc(fmtDate(item.date))}${time ? ` · ${esc(time)}` : ""}</div>
+            <div class="entry-body">
+              <div class="entry-title">↔ ${esc(item.mode || "Spostamento")}${(item.from || item.to) ? ` · ${esc(item.from || "?")} → ${esc(item.to || "?")}` : ""}</div>
+              ${item.notes ? `<div class="entry-notes">${esc(item.notes)}</div>` : ""}
+              ${item.link ? `<div class="entry-sub">${esc(item.link)}</div>` : ""}
+            </div>
+          </div>`;
+      }
+      return `
+        <div class="entry entry-activity">
+          <div class="entry-date">${esc(fmtDate(item.date))}${item.time ? ` · ${esc(item.time)}` : ""}</div>
+          <div class="entry-body">
+            <div class="entry-title">◈ ${esc(item.title || "Attività")}</div>
+            ${item.location ? `<div class="entry-sub">${esc(item.location)}</div>` : ""}
+            ${item.notes ? `<div class="entry-notes">${esc(item.notes)}</div>` : ""}
+            ${item.link ? `<div class="entry-sub">${esc(item.link)}</div>` : ""}
+          </div>
+        </div>`;
+    }).join("");
+
+    const flightBlock = (label, f) => `
+      <div class="flight">
+        <strong>${label}</strong> —
+        ${f.date ? esc(fmtDate(f.date)) : "data da definire"}
+        ${f.from && f.to ? ` · ${esc(f.from)} → ${esc(f.to)}` : ""}
+        ${f.depTime ? ` · Partenza ${esc(f.depTime)}` : ""}
+        ${f.arrTime ? ` · Arrivo ${esc(f.arrTime)}` : ""}
+      </div>`;
+
+    return `<!DOCTYPE html><html lang="it"><head><meta charset="UTF-8" />
+      <title>${esc(tripName)}</title>
+      <style>
+        body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; color: #1C2128; padding: 24px; max-width: 720px; margin: 0 auto; }
+        h1 { font-size: 22px; margin-bottom: 4px; }
+        .flight { font-size: 12.5px; background: #1C2128; color: #fff; padding: 8px 12px; border-radius: 8px; margin: 6px 0; }
+        .entry { display: flex; gap: 10px; margin: 10px 0; padding-bottom: 10px; border-bottom: 1px solid #eee; page-break-inside: avoid; }
+        .entry-date { width: 110px; flex-shrink: 0; font-size: 11px; font-weight: 600; color: #3D5A6C; font-family: monospace; }
+        .entry-title { font-weight: 700; font-size: 13.5px; margin-bottom: 2px; }
+        .entry-sub { font-size: 12px; color: #555; }
+        .entry-notes { font-size: 12px; color: #5A4632; background: #FBEEDB; padding: 6px 8px; border-radius: 6px; margin-top: 4px; white-space: pre-wrap; }
+        table.meta { font-size: 11.5px; margin-top: 4px; border-collapse: collapse; }
+        table.meta td { padding: 1px 8px 1px 0; color: #444; }
+        table.meta td:first-child { color: #888; }
+        @media print { body { padding: 0; } }
+      </style></head><body>
+      <h1>${esc(tripName)}</h1>
+      ${flightBlock("Volo andata", flightOut)}
+      ${rows}
+      ${flightBlock("Volo ritorno", flightIn)}
+      </body></html>`;
+  }
+
+  function exportPdf() {
+    const html = buildTripSummaryHTML();
+    const w = window.open("", "_blank");
+    if (!w) {
+      alert("Abilita i pop-up per esportare il PDF, poi riprova.");
+      return false;
+    }
+    w.document.write(html);
+    w.document.close();
+    setTimeout(() => w.print(), 350);
+    return true;
+  }
+
+  function startDeleteFlow() {
+    exportPdf();
+    setDeleteInput("");
+    setConfirmingDelete(true);
+  }
+  function cancelDeleteFlow() {
+    setConfirmingDelete(false);
+    setDeleteInput("");
+  }
+  function confirmDelete() {
+    if (deleteInput.trim().toUpperCase() !== "ELIMINA") return;
+    setTripName("Il mio viaggio");
+    setFlightOut(emptyFlight());
+    setFlightIn(emptyFlight());
+    setItems([]);
+    setConfirmingDelete(false);
+    setDeleteInput("");
+  }
+
+  return (
+    <div style={styles.page}>
+      <link
+        rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      />
+      <div style={styles.wrap}>
+        <header style={styles.header}>
+          <div style={styles.eyebrow}>DIARIO DI VIAGGIO</div>
+          {nameEditing ? (
+            <input
+              autoFocus
+              value={tripName}
+              onChange={(e) => setTripName(e.target.value)}
+              onBlur={() => setNameEditing(false)}
+              onKeyDown={(e) => e.key === "Enter" && setNameEditing(false)}
+              style={styles.titleInput}
+            />
+          ) : (
+            <h1 style={styles.title} onClick={() => setNameEditing(true)}>
+              {tripName}
+              <Pencil size={16} style={{ marginLeft: 10, opacity: 0.35 }} />
+            </h1>
+          )}
+          <div style={styles.saveIndicator}>
+            {saveState === "saving" && "Salvataggio…"}
+            {saveState === "saved" && "✓ Salvato"}
+          </div>
+        </header>
+
+        <FlightCard
+          label="VOLO ANDATA"
+          icon={<Plane size={18} style={{ transform: "rotate(45deg)" }} />}
+          flight={flightOut}
+          editing={editingFlight === "out"}
+          onEdit={() => setEditingFlight("out")}
+          onDone={() => setEditingFlight(null)}
+          onChange={(patch) => setFlightOut((f) => ({ ...f, ...patch }))}
+        />
+
+        <div style={styles.timeline}>
+          <div style={styles.timelineLine} />
+
+          {sorted.length === 0 && (
+            <div style={styles.emptyState}>
+              <Bed size={22} style={{ opacity: 0.4, marginBottom: 8 }} />
+              <div style={styles.emptyTitle}>Nessuna voce ancora</div>
+              <div style={styles.emptyText}>
+                Aggiungi un pernottamento, un'attività o uno spostamento per iniziare.
+              </div>
+            </div>
+          )}
+
+          {sorted.map((item) =>
+            item.type === "night" ? (
+              <NightRow
+                key={item.id}
+                item={item}
+                editing={editingId === item.id}
+                onEdit={() => setEditingId(editingId === item.id ? null : item.id)}
+                onView={() => setViewingId(item.id)}
+                onChange={(p) => updateItem(item.id, p)}
+                onDelete={() => removeItem(item.id)}
+              />
+            ) : item.type === "transport" ? (
+              <TransportRow
+                key={item.id}
+                item={item}
+                editing={editingId === item.id}
+                onEdit={() => setEditingId(editingId === item.id ? null : item.id)}
+                onView={() => setViewingId(item.id)}
+                onChange={(p) => updateItem(item.id, p)}
+                onDelete={() => removeItem(item.id)}
+              />
+            ) : (
+              <ActivityRow
+                key={item.id}
+                item={item}
+                editing={editingId === item.id}
+                onEdit={() => setEditingId(editingId === item.id ? null : item.id)}
+                onView={() => setViewingId(item.id)}
+                onChange={(p) => updateItem(item.id, p)}
+                onDelete={() => removeItem(item.id)}
+              />
+            )
+          )}
+
+          <div style={styles.stopRow}>
+            <div style={styles.dateCol}>
+              <div style={{ ...styles.dateDot, background: "transparent", border: "2px dashed #8B92A0" }} />
+            </div>
+            <div style={{ flex: 1 }}>
+              {addMode === null && (
+                <div style={styles.addButtonsRow}>
+                  <button style={styles.addStopBtn} onClick={openNightAddForm}>
+                    <Bed size={15} /> Pernottamento
+                  </button>
+                  <button style={styles.addStopBtn} onClick={addActivity}>
+                    <Compass size={15} /> Attività
+                  </button>
+                  <button style={styles.addStopBtn} onClick={addTransport}>
+                    <ArrowRightLeft size={15} /> Spostamento
+                  </button>
+                </div>
+              )}
+              {addMode === "night" && (
+                <div style={styles.card}>
+                  <div style={styles.cardTopLeft}>
+                    <Bed size={15} style={{ opacity: 0.55 }} />
+                    <span style={styles.cardHotel}>Nuovo pernottamento</span>
+                  </div>
+                  <NightForm draft={nightDraft} onChange={(p) => setNightDraft((d) => ({ ...d, ...p }))} />
+                  <div style={styles.formActions}>
+                    <button style={styles.deleteBtn} onClick={() => { setAddMode(null); setNightDraft(emptyNightDraft()); }}>
+                      Annulla
+                    </button>
+                    <button style={styles.doneBtn} onClick={commitNightDraft}>
+                      <Check size={13} /> Aggiungi {Math.max(1, Number(nightDraft.nights) || 1)} nott{Math.max(1, Number(nightDraft.nights) || 1) === 1 ? "e" : "i"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <FlightCard
+          label="VOLO RITORNO"
+          icon={<Plane size={18} style={{ transform: "rotate(225deg)" }} />}
+          flight={flightIn}
+          editing={editingFlight === "in"}
+          onEdit={() => setEditingFlight("in")}
+          onDone={() => setEditingFlight(null)}
+          onChange={(patch) => setFlightIn((f) => ({ ...f, ...patch }))}
+        />
+
+        <div style={styles.footer}>Dati salvati automaticamente sul dispositivo</div>
+
+        <button style={styles.exportBtn} onClick={exportPdf}>
+          <StickyNote size={13} /> Esporta PDF del viaggio
+        </button>
+
+        {!confirmingDelete ? (
+          <button style={styles.resetBtn} onClick={startDeleteFlow}>
+            <Trash2 size={13} /> Elimina tutto il viaggio
+          </button>
+        ) : (
+          <div style={styles.deletePanel}>
+            <div style={styles.deletePanelText}>
+              Azione irreversibile. Il PDF di sicurezza è stato scaricato. Per confermare, scrivi <strong>ELIMINA</strong> qui sotto:
+            </div>
+            <input
+              autoFocus
+              value={deleteInput}
+              onChange={(e) => setDeleteInput(e.target.value)}
+              placeholder="ELIMINA"
+              style={styles.deleteInput}
+            />
+            <div style={styles.formActions}>
+              <button style={styles.deleteBtn} onClick={cancelDeleteFlow}>Annulla</button>
+              <button
+                style={{
+                  ...styles.resetBtnConfirm,
+                  opacity: deleteInput.trim().toUpperCase() === "ELIMINA" ? 1 : 0.4,
+                  cursor: deleteInput.trim().toUpperCase() === "ELIMINA" ? "pointer" : "not-allowed",
+                  width: "auto", marginTop: 0, padding: "8px 16px",
+                }}
+                onClick={confirmDelete}
+                disabled={deleteInput.trim().toUpperCase() !== "ELIMINA"}
+              >
+                <Trash2 size={13} /> Elimina definitivamente
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <DetailModal
+        item={items.find((it) => it.id === viewingId) || null}
+        onClose={() => setViewingId(null)}
+        onEdit={() => {
+          setEditingId(viewingId);
+          setViewingId(null);
+        }}
+      />
+    </div>
+  );
+}
+
+function FlightCard({ label, icon, flight, editing, onEdit, onDone, onChange }) {
+  return (
+    <div style={styles.flightCard}>
+      <div style={styles.flightStub}>
+        <div style={styles.flightIconWrap}>{icon}</div>
+        <div style={{ flex: 1 }}>
+          <div style={styles.flightLabel}>{label}</div>
+          {editing ? (
+            <div style={styles.flightEditRow}>
+              <input type="date" value={flight.date} onChange={(e) => onChange({ date: e.target.value })} style={styles.miniInput} />
+              <input placeholder="Da" value={flight.from} onChange={(e) => onChange({ from: e.target.value })} style={{ ...styles.miniInput, width: 70 }} />
+              <input placeholder="A" value={flight.to} onChange={(e) => onChange({ to: e.target.value })} style={{ ...styles.miniInput, width: 70 }} />
+              <input type="time" value={flight.depTime} onChange={(e) => onChange({ depTime: e.target.value })} style={styles.miniInput} />
+              <input type="time" value={flight.arrTime} onChange={(e) => onChange({ arrTime: e.target.value })} style={styles.miniInput} />
+            </div>
+          ) : (
+            <div style={styles.flightInfo}>
+              {flight.date ? fmtDate(flight.date) : "Data da definire"}
+              {flight.from && flight.to && ` · ${flight.from} → ${flight.to}`}
+              {flight.depTime && ` · Partenza ${flight.depTime}`}
+              {flight.arrTime && ` · Arrivo ${flight.arrTime}`}
+            </div>
+          )}
+        </div>
+        <button style={styles.iconBtn} onClick={editing ? onDone : onEdit}>
+          {editing ? <Check size={15} /> : <Pencil size={14} />}
+        </button>
+      </div>
+      <div style={styles.perforation}>
+        {Array.from({ length: 28 }).map((_, i) => <span key={i} style={styles.perfDot} />)}
+      </div>
+    </div>
+  );
+}
+
+function NightRow({ item, editing, onEdit, onView, onChange, onDelete }) {
+  return (
+    <div style={styles.stopRow}>
+      <div style={styles.dateCol}>
+        <div style={styles.dateBadge}>{fmtNightRange(item.date)}</div>
+        <div style={styles.dateDot} />
+        <div style={styles.dateDash} />
+      </div>
+      <div style={{ ...styles.card, cursor: !editing ? "pointer" : "default" }} onClick={!editing ? onView : undefined}>
+        <div style={styles.cardTop}>
+          <div style={styles.cardTopLeft}>
+            <Bed size={15} style={{ opacity: 0.55, flexShrink: 0 }} />
+            <span style={styles.cardHotel}>{item.hotel || "Nome struttura"}</span>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              style={styles.iconBtn}
+              onClick={(e) => { e.stopPropagation(); onEdit(); }}
+              aria-label="Modifica"
+            >
+              {editing ? <Check size={15} /> : <Pencil size={14} />}
+            </button>
+          </div>
+        </div>
+        {item.location && (
+          <div style={styles.cardSub}>
+            <MapPin size={12} style={{ opacity: 0.5 }} /> {item.location}
+          </div>
+        )}
+        {editing && (
+          <>
+            <NightEditForm item={item} onChange={onChange} />
+            <div style={styles.formActions}>
+              <button style={styles.deleteBtn} onClick={onDelete}><Trash2 size={13} /> Elimina questa notte</button>
+              <button style={styles.doneBtn} onClick={onEdit}><Check size={13} /> Fatto</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function NightDetails({ item }) {
+  const hasMeta = item.confirmation || item.pin || item.cancelInfo || item.address || item.link;
+  if (!hasMeta) return null;
+  return (
+    <div style={styles.details}>
+      <div style={styles.metaGrid}>
+        {item.confirmation && <MetaItem icon={<KeyRound size={12} />} label="Conferma" value={item.confirmation} mono />}
+        {item.pin && <MetaItem icon={<KeyRound size={12} />} label="PIN" value={item.pin} mono />}
+        <MetaItem icon={<Wallet size={12} />} label="Pagato" value={item.paid ? "Sì" : "No"} />
+        {item.cancelInfo && <MetaItem icon={<Wallet size={12} />} label="Cancellazione" value={item.cancelInfo} />}
+      </div>
+      {item.address && (
+        <div style={styles.addressRow}>
+          <Navigation size={12} style={{ opacity: 0.5, flexShrink: 0, marginTop: 2 }} />
+          <span>{item.address}</span>
+        </div>
+      )}
+      {item.link && (
+        <a href={item.link} target="_blank" rel="noreferrer" style={styles.linkRow}>
+          <LinkIcon size={12} /> Apri prenotazione
+        </a>
+      )}
+    </div>
+  );
+}
+
+function NightEditForm({ item, onChange }) {
+  const f = (key) => (e) => onChange({ [key]: e.target.value });
+  return (
+    <div style={styles.form}>
+      <Field label={`Data (notte ${fmtNightRange(item.date)})`}>
+        <input type="date" value={item.date} onChange={f("date")} style={styles.input} />
+      </Field>
+      <Field label="Struttura">
+        <input value={item.hotel} onChange={f("hotel")} style={styles.input} placeholder="Nome hotel / appartamento" />
+      </Field>
+      <Field label="Località">
+        <input value={item.location} onChange={f("location")} style={styles.input} placeholder="Città / zona" />
+      </Field>
+      <div style={styles.formRow}>
+        <Field label="Codice conferma">
+          <input value={item.confirmation} onChange={f("confirmation")} style={styles.input} />
+        </Field>
+        <Field label="PIN">
+          <input value={item.pin} onChange={f("pin")} style={styles.input} />
+        </Field>
+      </div>
+      <div style={styles.formRow}>
+        <Field label="Pagato">
+          <button
+            type="button"
+            onClick={() => onChange({ paid: !item.paid })}
+            style={{ ...styles.toggleBtn, background: item.paid ? "#3D5A6C" : "transparent", color: item.paid ? "#F7F5F0" : "#5B6472" }}
+          >
+            {item.paid ? "Sì" : "No"}
+          </button>
+        </Field>
+        <Field label="Cancellazione / prezzo">
+          <input value={item.cancelInfo} onChange={f("cancelInfo")} style={styles.input} placeholder='es. "45530" o "no"' />
+        </Field>
+      </div>
+      <Field label="Link prenotazione">
+        <input value={item.link} onChange={f("link")} style={styles.input} placeholder="https://…" />
+      </Field>
+      <Field label="Indirizzo">
+        <input value={item.address} onChange={f("address")} style={styles.input} />
+      </Field>
+    </div>
+  );
+}
+
+function ActivityRow({ item, editing, onEdit, onView, onChange, onDelete }) {
+  return (
+    <div style={styles.stopRow}>
+      <div style={styles.dateCol}>
+        <div style={styles.dateBadge}>{fmtDate(item.date)}</div>
+        {item.time && <div style={styles.timeBadge}><Clock size={9} /> {item.time}</div>}
+        <div style={{ ...styles.dateDot, background: "#C97C3D" }} />
+        <div style={styles.dateDash} />
+      </div>
+      <div style={{ ...styles.card, background: "#FBF3E7", borderColor: "#EAD9B8", cursor: !editing ? "pointer" : "default" }} onClick={!editing ? onView : undefined}>
+        <div style={styles.cardTop}>
+          <div style={styles.cardTopLeft}>
+            <Compass size={15} style={{ opacity: 0.6, flexShrink: 0, color: "#B5702E" }} />
+            <span style={styles.cardHotel}>{item.title || "Nuova attività"}</span>
+          </div>
+          <button style={styles.iconBtn} onClick={(e) => { e.stopPropagation(); onEdit(); }}>
+            {editing ? <Check size={15} /> : <Pencil size={14} />}
+          </button>
+        </div>
+        {editing ? (
+          <>
+            <div style={styles.form}>
+              <div style={styles.formRow}>
+                <Field label="Data">
+                  <input type="date" value={item.date} onChange={(e) => onChange({ date: e.target.value })} style={styles.input} />
+                </Field>
+                <Field label="Ora di inizio">
+                  <input type="time" value={item.time} onChange={(e) => onChange({ time: e.target.value })} style={styles.input} />
+                </Field>
+              </div>
+              <Field label="Titolo">
+                <input value={item.title} onChange={(e) => onChange({ title: e.target.value })} style={styles.input} placeholder="Es. Escursione a Oppdal" />
+              </Field>
+              <Field label="Località">
+                <input value={item.location} onChange={(e) => onChange({ location: e.target.value })} style={styles.input} />
+              </Field>
+              <Field label="Note">
+                <textarea value={item.notes} onChange={(e) => onChange({ notes: e.target.value })} style={styles.textarea} rows={3} placeholder="Dettagli, orari, idee…" />
+              </Field>
+              <Field label="Link">
+                <input value={item.link} onChange={(e) => onChange({ link: e.target.value })} style={styles.input} placeholder="https://…" />
+              </Field>
+            </div>
+            <div style={styles.formActions}>
+              <button style={styles.deleteBtn} onClick={onDelete}><Trash2 size={13} /> Elimina attività</button>
+              <button style={styles.doneBtn} onClick={onEdit}><Check size={13} /> Fatto</button>
+            </div>
+          </>
+        ) : (
+          item.location && (
+            <div style={styles.cardSub}>
+              <MapPin size={12} style={{ opacity: 0.5 }} /> {item.location}
+            </div>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
+const TRANSPORT_MODES = ["Auto", "Treno", "Aereo", "Traghetto", "Bus", "A piedi", "Altro"];
+
+function TransportRow({ item, editing, onEdit, onView, onChange, onDelete }) {
+  const timeRange = item.startTime && item.endTime
+    ? `${item.startTime}–${item.endTime}`
+    : (item.startTime || item.endTime || "");
+  return (
+    <div style={styles.stopRow}>
+      <div style={styles.dateCol}>
+        <div style={styles.dateBadge}>{fmtDate(item.date)}</div>
+        {timeRange && <div style={styles.timeBadge}><Clock size={9} /> {timeRange}</div>}
+        <div style={{ ...styles.dateDot, background: "#5B7A8C" }} />
+        <div style={styles.dateDash} />
+      </div>
+      <div style={{ ...styles.card, background: "#F0F4F6", borderColor: "#D6E0E4", cursor: !editing ? "pointer" : "default" }} onClick={!editing ? onView : undefined}>
+        <div style={styles.cardTop}>
+          <div style={styles.cardTopLeft}>
+            <ArrowRightLeft size={15} style={{ opacity: 0.6, flexShrink: 0, color: "#3D5A6C" }} />
+            <span style={styles.cardHotel}>
+              {item.mode || "Spostamento"}
+              {(item.from || item.to) && ` · ${item.from || "?"} → ${item.to || "?"}`}
+            </span>
+          </div>
+          <button style={styles.iconBtn} onClick={(e) => { e.stopPropagation(); onEdit(); }}>
+            {editing ? <Check size={15} /> : <Pencil size={14} />}
+          </button>
+        </div>
+        {editing && (
+          <>
+            <div style={styles.form}>
+              <Field label="Data">
+                <input type="date" value={item.date} onChange={(e) => onChange({ date: e.target.value })} style={styles.input} />
+              </Field>
+              <Field label="Mezzo">
+                <select value={item.mode} onChange={(e) => onChange({ mode: e.target.value })} style={styles.input}>
+                  <option value="">Seleziona…</option>
+                  {TRANSPORT_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+                </select>
+              </Field>
+              <div style={styles.formRow}>
+                <Field label="Ora inizio">
+                  <input type="time" value={item.startTime} onChange={(e) => onChange({ startTime: e.target.value })} style={styles.input} />
+                </Field>
+                <Field label="Ora fine">
+                  <input type="time" value={item.endTime} onChange={(e) => onChange({ endTime: e.target.value })} style={styles.input} />
+                </Field>
+              </div>
+              <div style={styles.formRow}>
+                <Field label="Da">
+                  <input value={item.from} onChange={(e) => onChange({ from: e.target.value })} style={styles.input} />
+                </Field>
+                <Field label="A">
+                  <input value={item.to} onChange={(e) => onChange({ to: e.target.value })} style={styles.input} />
+                </Field>
+              </div>
+              <Field label="Note">
+                <textarea value={item.notes} onChange={(e) => onChange({ notes: e.target.value })} style={styles.textarea} rows={2} placeholder="Numero volo/treno, binario, bagagli…" />
+              </Field>
+              <Field label="Link">
+                <input value={item.link} onChange={(e) => onChange({ link: e.target.value })} style={styles.input} placeholder="https://…" />
+              </Field>
+            </div>
+            <div style={styles.formActions}>
+              <button style={styles.deleteBtn} onClick={onDelete}><Trash2 size={13} /> Elimina spostamento</button>
+              <button style={styles.doneBtn} onClick={onEdit}><Check size={13} /> Fatto</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function NightForm({ draft, onChange }) {
+  const f = (key) => (e) => onChange({ [key]: e.target.value });
+  return (
+    <div style={styles.form}>
+      <div style={styles.formRow}>
+        <Field label="Check-in">
+          <input type="date" value={draft.checkIn} onChange={f("checkIn")} style={styles.input} />
+        </Field>
+        <Field label="Numero di notti">
+          <div style={styles.stepper}>
+            <button type="button" style={styles.stepperBtn} onClick={() => onChange({ nights: Math.max(1, (Number(draft.nights) || 1) - 1) })}>
+              <Minus size={13} />
+            </button>
+            <span style={styles.stepperVal}>{draft.nights}</span>
+            <button type="button" style={styles.stepperBtn} onClick={() => onChange({ nights: (Number(draft.nights) || 1) + 1 })}>
+              <Plus size={13} />
+            </button>
+          </div>
+        </Field>
+      </div>
+      <Field label="Struttura">
+        <input value={draft.hotel} onChange={f("hotel")} style={styles.input} placeholder="Nome hotel / appartamento" />
+      </Field>
+      <Field label="Località">
+        <input value={draft.location} onChange={f("location")} style={styles.input} placeholder="Città / zona" />
+      </Field>
+      <div style={styles.formRow}>
+        <Field label="Codice conferma">
+          <input value={draft.confirmation} onChange={f("confirmation")} style={styles.input} />
+        </Field>
+        <Field label="PIN">
+          <input value={draft.pin} onChange={f("pin")} style={styles.input} />
+        </Field>
+      </div>
+      <div style={styles.formRow}>
+        <Field label="Pagato">
+          <button
+            type="button"
+            onClick={() => onChange({ paid: !draft.paid })}
+            style={{ ...styles.toggleBtn, background: draft.paid ? "#3D5A6C" : "transparent", color: draft.paid ? "#F7F5F0" : "#5B6472" }}
+          >
+            {draft.paid ? "Sì" : "No"}
+          </button>
+        </Field>
+        <Field label="Cancellazione / prezzo">
+          <input value={draft.cancelInfo} onChange={f("cancelInfo")} style={styles.input} placeholder='es. "45530" o "no"' />
+        </Field>
+      </div>
+      <Field label="Link prenotazione">
+        <input value={draft.link} onChange={f("link")} style={styles.input} placeholder="https://…" />
+      </Field>
+      <Field label="Indirizzo">
+        <input value={draft.address} onChange={f("address")} style={styles.input} />
+      </Field>
+      <div style={styles.hint}>
+        Verrà creata una voce separata per ciascuna delle {Math.max(1, Number(draft.nights) || 1)} notti, modificabile singolarmente.
+      </div>
+    </div>
+  );
+}
+
+function DetailModal({ item, onClose, onEdit }) {
+  if (!item) return null;
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHandle} />
+        <div style={styles.modalHeader}>
+          <div style={styles.modalHeaderLeft}>
+            {item.type === "night" && <Bed size={18} style={{ color: "#3D5A6C" }} />}
+            {item.type === "activity" && <Compass size={18} style={{ color: "#B5702E" }} />}
+            {item.type === "transport" && <ArrowRightLeft size={18} style={{ color: "#3D5A6C" }} />}
+            <span style={styles.modalDate}>
+              {item.type === "night" ? fmtNightRange(item.date) : fmtDate(item.date)}
+              {item.type === "activity" && item.time && ` · ${item.time}`}
+              {item.type === "transport" && (item.startTime || item.endTime) &&
+                ` · ${item.startTime || ""}${item.startTime && item.endTime ? "–" : ""}${item.endTime || ""}`}
+            </span>
+          </div>
+          <button style={styles.iconBtn} onClick={onClose} aria-label="Chiudi">
+            <X size={16} />
+          </button>
+        </div>
+
+        {item.type === "night" && (
+          <>
+            <div style={styles.modalTitle}>{item.hotel || "Nome struttura"}</div>
+            {item.location && (
+              <div style={styles.modalSub}><MapPin size={13} style={{ opacity: 0.5 }} /> {item.location}</div>
+            )}
+            <NightDetails item={item} />
+          </>
+        )}
+
+        {item.type === "activity" && (
+          <>
+            <div style={styles.modalTitle}>{item.title || "Nuova attività"}</div>
+            {item.location && (
+              <div style={styles.modalSub}><MapPin size={13} style={{ opacity: 0.5 }} /> {item.location}</div>
+            )}
+            {item.notes && (
+              <div style={{ ...styles.noteBlock, marginTop: 12, fontSize: 14 }}>
+                <StickyNote size={14} style={{ opacity: 0.6, flexShrink: 0, marginTop: 2 }} />
+                <span style={{ whiteSpace: "pre-wrap" }}>{item.notes}</span>
+              </div>
+            )}
+            {item.link && (
+              <a href={item.link} target="_blank" rel="noreferrer" style={{ ...styles.linkRow, marginTop: 10 }}>
+                <LinkIcon size={13} /> Apri link
+              </a>
+            )}
+          </>
+        )}
+
+        {item.type === "transport" && (
+          <>
+            <div style={styles.modalTitle}>{item.mode || "Spostamento"}</div>
+            {(item.from || item.to) && (
+              <div style={styles.modalSub}><Navigation size={13} style={{ opacity: 0.5 }} /> {item.from || "?"} → {item.to || "?"}</div>
+            )}
+            {item.notes && (
+              <div style={{ ...styles.noteBlock, marginTop: 12, fontSize: 14, background: "#E8EEF0", borderLeftColor: "#5B7A8C", color: "#2F4550" }}>
+                <StickyNote size={14} style={{ opacity: 0.6, flexShrink: 0, marginTop: 2 }} />
+                <span style={{ whiteSpace: "pre-wrap" }}>{item.notes}</span>
+              </div>
+            )}
+            {item.link && (
+              <a href={item.link} target="_blank" rel="noreferrer" style={{ ...styles.linkRow, marginTop: 10 }}>
+                <LinkIcon size={13} /> Apri link
+              </a>
+            )}
+          </>
+        )}
+
+        <button style={styles.modalEditBtn} onClick={onEdit}>
+          <Pencil size={14} /> Modifica
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MetaItem({ icon, label, value, mono }) {
+  return (
+    <div style={styles.metaItem}>
+      <div style={styles.metaLabel}>{icon} {label}</div>
+      <div style={{ ...styles.metaValue, fontFamily: mono ? "'JetBrains Mono', monospace" : undefined }}>{value}</div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label style={styles.fieldWrap}>
+      <span style={styles.fieldLabel}>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+const styles = {
+  page: { minHeight: "100vh", background: "#EFEDE6", fontFamily: "'Space Grotesk', system-ui, sans-serif", color: "#1C2128", padding: "24px 14px 60px" },
+  wrap: { maxWidth: 640, margin: "0 auto" },
+  header: { marginBottom: 22, position: "relative" },
+  eyebrow: { fontSize: 11, letterSpacing: "0.14em", color: "#3D5A6C", fontWeight: 600, marginBottom: 4 },
+  title: { fontSize: 26, fontWeight: 700, margin: 0, display: "flex", alignItems: "center", cursor: "pointer", lineHeight: 1.2 },
+  titleInput: { fontSize: 26, fontWeight: 700, fontFamily: "inherit", border: "none", borderBottom: "2px solid #3D5A6C", background: "transparent", outline: "none", width: "100%", padding: "2px 0" },
+  saveIndicator: { position: "absolute", top: 0, right: 0, fontSize: 11, color: "#8B92A0" },
+  flightCard: { background: "#1C2128", borderRadius: 14, color: "#F7F5F0", overflow: "hidden", marginBottom: 18 },
+  flightStub: { display: "flex", alignItems: "center", gap: 12, padding: "14px 16px" },
+  flightIconWrap: { width: 34, height: 34, borderRadius: "50%", background: "rgba(201,124,61,0.18)", color: "#C97C3D", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
+  flightLabel: { fontSize: 10, letterSpacing: "0.12em", color: "#8B92A0", fontWeight: 600, marginBottom: 2 },
+  flightInfo: { fontSize: 13.5, color: "#E7E4DC" },
+  flightEditRow: { display: "flex", gap: 6, flexWrap: "wrap" },
+  perforation: { display: "flex", justifyContent: "space-between", padding: "0 10px 8px" },
+  perfDot: { width: 3, height: 3, borderRadius: "50%", background: "rgba(247,245,240,0.25)" },
+  timeline: { position: "relative" },
+  timelineLine: { position: "absolute", left: 34, top: 6, bottom: 40, width: 1, background: "#D8D3C6" },
+  stopRow: { display: "flex", gap: 12, marginBottom: 14, position: "relative" },
+  dateCol: { width: 68, flexShrink: 0, display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 4 },
+  dateBadge: { fontSize: 10.5, fontWeight: 600, fontFamily: "'JetBrains Mono', monospace", color: "#3D5A6C", marginBottom: 2, textAlign: "center" },
+  timeBadge: { fontSize: 9.5, fontFamily: "'JetBrains Mono', monospace", color: "#9A9587", marginBottom: 6, display: "flex", alignItems: "center", gap: 2 },
+  dateDot: { width: 9, height: 9, borderRadius: "50%", background: "#3D5A6C", zIndex: 1, flexShrink: 0 },
+  dateDash: { flex: 1 },
+  card: { flex: 1, background: "#FBFAF6", border: "1px solid #E2DDCE", borderRadius: 12, padding: "12px 14px", minWidth: 0 },
+  cardTop: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 },
+  cardTopLeft: { display: "flex", alignItems: "center", gap: 7, minWidth: 0 },
+  cardHotel: { fontWeight: 600, fontSize: 14.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  cardSub: { display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "#6B7280", marginTop: 4 },
+  iconBtn: { width: 28, height: 28, borderRadius: 8, border: "1px solid #E2DDCE", background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "#3D5A6C", flexShrink: 0 },
+  details: { marginTop: 10, display: "flex", flexDirection: "column", gap: 8 },
+  metaGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 },
+  metaItem: { background: "#F1EEE4", borderRadius: 8, padding: "6px 9px" },
+  metaLabel: { fontSize: 10, color: "#8B92A0", display: "flex", alignItems: "center", gap: 4, fontWeight: 600, marginBottom: 2 },
+  metaValue: { fontSize: 13, fontWeight: 500 },
+  addressRow: { display: "flex", gap: 6, fontSize: 12.5, color: "#4B5563" },
+  linkRow: { display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12.5, color: "#3D5A6C", fontWeight: 600, textDecoration: "none", width: "fit-content" },
+  noteBlock: { display: "flex", gap: 7, background: "#FBEEDB", borderLeft: "3px solid #C97C3D", borderRadius: 6, padding: "8px 10px", fontSize: 12.5, color: "#5A4632", lineHeight: 1.5 },
+  form: { marginTop: 10, display: "flex", flexDirection: "column", gap: 9 },
+  formRow: { display: "flex", gap: 9 },
+  fieldWrap: { display: "flex", flexDirection: "column", gap: 3, flex: 1, fontSize: 12 },
+  fieldLabel: { fontSize: 10.5, color: "#8B92A0", fontWeight: 600 },
+  input: { border: "1px solid #E2DDCE", borderRadius: 8, padding: "7px 9px", fontSize: 13, fontFamily: "inherit", background: "#fff", outline: "none", width: "100%", boxSizing: "border-box" },
+  miniInput: { border: "1px solid rgba(247,245,240,0.25)", borderRadius: 6, padding: "5px 7px", fontSize: 12, background: "rgba(255,255,255,0.06)", color: "#F7F5F0", outline: "none" },
+  textarea: { border: "1px solid #E2DDCE", borderRadius: 8, padding: "7px 9px", fontSize: 13, fontFamily: "inherit", background: "#fff", outline: "none", resize: "vertical", width: "100%", boxSizing: "border-box" },
+  toggleBtn: { border: "1px solid #3D5A6C", borderRadius: 8, padding: "7px 0", fontSize: 13, fontWeight: 600, cursor: "pointer", width: "100%" },
+  stepper: { display: "flex", alignItems: "center", gap: 8, border: "1px solid #E2DDCE", borderRadius: 8, padding: "3px 6px", width: "fit-content", background: "#fff" },
+  stepperBtn: { width: 22, height: 22, borderRadius: 6, border: "1px solid #E2DDCE", background: "#F7F5F0", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" },
+  stepperVal: { fontSize: 13, fontWeight: 600, minWidth: 14, textAlign: "center" },
+  hint: { fontSize: 11, color: "#8B92A0", fontStyle: "italic" },
+  formActions: { display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: "1px solid #EDE9DC" },
+  deleteBtn: { display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "#B54B3A", background: "none", border: "none", cursor: "pointer", padding: "4px 2px" },
+  doneBtn: { display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: "#fff", background: "#3D5A6C", border: "none", borderRadius: 8, padding: "6px 12px", cursor: "pointer", fontWeight: 600 },
+  addButtonsRow: { display: "flex", gap: 6, flexWrap: "wrap" },
+  addStopBtn: { flex: "1 1 30%", minWidth: 100, display: "flex", alignItems: "center", gap: 5, justifyContent: "center", border: "1.5px dashed #C7C0AC", borderRadius: 12, padding: "10px 6px", background: "transparent", color: "#6B7280", fontSize: 12, fontWeight: 600, cursor: "pointer" },
+  emptyState: { marginLeft: 80, padding: "20px 0", color: "#8B92A0" },
+  emptyTitle: { fontWeight: 600, color: "#4B5563", marginBottom: 2 },
+  emptyText: { fontSize: 12.5, maxWidth: 340 },
+  footer: { textAlign: "center", fontSize: 11, color: "#A3A08F", marginTop: 24 },
+  resetBtn: {
+    display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+    width: "100%", marginTop: 10, padding: "11px", borderRadius: 10,
+    border: "1px solid #E2DDCE", background: "transparent", color: "#9A8F82",
+    fontSize: 12.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+  },
+  exportBtn: {
+    display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+    width: "100%", marginTop: 14, padding: "11px", borderRadius: 10,
+    border: "1px solid #3D5A6C", background: "transparent", color: "#3D5A6C",
+    fontSize: 12.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+  },
+  resetBtnConfirm: {
+    display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+    width: "100%", marginTop: 14, padding: "11px", borderRadius: 10,
+    border: "1px solid #B54B3A", background: "#B54B3A", color: "#fff",
+    fontSize: 12.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+  },
+  deletePanel: {
+    marginTop: 14, padding: "14px", borderRadius: 10,
+    border: "1px solid #E9C7BF", background: "#FDF3F1",
+  },
+  deletePanelText: { fontSize: 12, color: "#7A4A40", lineHeight: 1.5, marginBottom: 10 },
+  deleteInput: {
+    border: "1px solid #E2B5AA", borderRadius: 8, padding: "9px 10px",
+    fontSize: 14, fontFamily: "'JetBrains Mono', monospace", background: "#fff",
+    outline: "none", width: "100%", boxSizing: "border-box", letterSpacing: "0.05em",
+  },
+  modalOverlay: {
+    position: "fixed", inset: 0, background: "rgba(28,33,40,0.55)",
+    display: "flex", alignItems: "flex-end", justifyContent: "center",
+    zIndex: 100, padding: 0,
+  },
+  modalCard: {
+    width: "100%", maxWidth: 640, maxHeight: "85vh", overflowY: "auto",
+    background: "#FBFAF6", borderRadius: "20px 20px 0 0",
+    padding: "10px 20px 24px", boxSizing: "border-box",
+    fontFamily: "'Space Grotesk', system-ui, sans-serif",
+  },
+  modalHandle: {
+    width: 36, height: 4, borderRadius: 4, background: "#D8D3C6",
+    margin: "4px auto 14px",
+  },
+  modalHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 },
+  modalHeaderLeft: { display: "flex", alignItems: "center", gap: 8 },
+  modalDate: { fontSize: 12.5, fontFamily: "'JetBrains Mono', monospace", color: "#6B7280", fontWeight: 600 },
+  modalTitle: { fontSize: 20, fontWeight: 700, marginBottom: 4 },
+  modalSub: { display: "flex", alignItems: "center", gap: 5, fontSize: 13.5, color: "#6B7280", marginBottom: 4 },
+  modalEditBtn: {
+    display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+    width: "100%", marginTop: 18, padding: "12px", borderRadius: 10,
+    border: "none", background: "#3D5A6C", color: "#fff",
+    fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+  },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<TripPlanner />);
+</script>
+</body>
+</html>
