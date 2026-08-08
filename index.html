@@ -68,6 +68,32 @@
     },
   };
 
+  // Test diretto via REST, senza passare dall'SDK Firebase: chiama l'endpoint
+  // di sign-up anonimo di Identity Toolkit e registra lo stato HTTP grezzo.
+  // Questo ci dice se il problema è nella rete/DNS (la fetch va in timeout)
+  // o è una risposta del server (es. 400 con un messaggio di errore preciso).
+  window.__connDebug.restTest = "in corso...";
+  (function () {
+    const url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" + firebaseConfig.apiKey;
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 8000);
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ returnSecureToken: true }),
+      signal: controller.signal,
+    })
+      .then(async (res) => {
+        clearTimeout(t);
+        const text = await res.text();
+        window.__connDebug.restTest = "HTTP " + res.status + ": " + text.slice(0, 200);
+      })
+      .catch((err) => {
+        clearTimeout(t);
+        window.__connDebug.restTest = "FETCH FALLITA: " + (err && err.name ? err.name + " — " : "") + (err && err.message ? err.message : String(err));
+      });
+  })();
+
   window.__authReady = new Promise((resolve, reject) => {
     auth.onAuthStateChanged(
       (user) => {
@@ -237,6 +263,16 @@ function TripPlanner() {
 
   const [connError, setConnError] = useState(null);
   const [, forceDebugRefresh] = useState(0);
+
+  useEffect(() => {
+    let count = 0;
+    const id = setInterval(() => {
+      count++;
+      forceDebugRefresh((n) => n + 1);
+      if (count > 12) clearInterval(id);
+    }, 800);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -596,6 +632,7 @@ function TripPlanner() {
         <div style={styles.footer}>Dati salvati automaticamente sul dispositivo</div>
         <div style={styles.debugLine}>
           debug — uid: {window.__connDebug?.uid || "nessuno"} · anon: {String(window.__connDebug?.isAnonymous)} · token: {window.__connDebug?.tokenOk === true ? "ok" : (window.__connDebug?.tokenError || "n/d")}
+          <br />rest: {window.__connDebug?.restTest || "n/d"}
         </div>
 
         <button style={styles.exportBtn} onClick={exportPdf}>
