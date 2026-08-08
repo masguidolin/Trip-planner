@@ -45,6 +45,8 @@
 
   const DOC_REF = () => db.collection("tripplanner").doc("main");
 
+  window.__connDebug = { authError: null, authOk: false };
+
   // Storage adapter con la stessa interfaccia usata nell'artifact
   // (get/set su una singola chiave), ma sostenuta da Firestore.
   window.storage = {
@@ -61,11 +63,24 @@
     },
   };
 
-  window.__authReady = new Promise((resolve) => {
-    auth.onAuthStateChanged((user) => {
-      if (user) resolve(user);
-      else auth.signInAnonymously().catch(console.error);
-    });
+  window.__authReady = new Promise((resolve, reject) => {
+    auth.onAuthStateChanged(
+      (user) => {
+        if (user) {
+          window.__connDebug.authOk = true;
+          resolve(user);
+        } else {
+          auth.signInAnonymously().catch((err) => {
+            window.__connDebug.authError = (err && err.code ? err.code + ": " : "") + (err && err.message ? err.message : String(err));
+            reject(err);
+          });
+        }
+      },
+      (err) => {
+        window.__connDebug.authError = (err && err.code ? err.code + ": " : "") + (err && err.message ? err.message : String(err));
+        reject(err);
+      }
+    );
   });
 </script>
 
@@ -201,9 +216,17 @@ function TripPlanner() {
 
   const defaultNewDate = flightOut.date ? addDays(flightOut.date, 1) : "";
 
+  const [connError, setConnError] = useState(null);
+
   useEffect(() => {
     (async () => {
-      await window.__authReady;
+      try {
+        await window.__authReady;
+      } catch (e) {
+        setConnError("Autenticazione Firebase fallita: " + (window.__connDebug.authError || e.message || String(e)));
+        setLoaded(true);
+        return;
+      }
       try {
         const res = await window.storage.get(STORAGE_KEY, false);
         if (res && res.value) {
@@ -214,7 +237,7 @@ function TripPlanner() {
           setItems(Array.isArray(data.items) ? data.items : []);
         }
       } catch (e) {
-        // nessun dato salvato ancora
+        setConnError("Errore di lettura da Firestore: " + (e.code ? e.code + " — " : "") + (e.message || String(e)));
       } finally {
         setLoaded(true);
       }
@@ -226,9 +249,11 @@ function TripPlanner() {
     try {
       await window.storage.set(STORAGE_KEY, JSON.stringify(next), false);
       setSaveState("saved");
+      setConnError(null);
       setTimeout(() => setSaveState("idle"), 1200);
     } catch (e) {
       setSaveState("idle");
+      setConnError("Errore di scrittura su Firestore: " + (e.code ? e.code + " — " : "") + (e.message || String(e)));
     }
   }, []);
 
@@ -410,6 +435,11 @@ function TripPlanner() {
         href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
       />
       <div style={styles.wrap}>
+        {connError && (
+          <div style={styles.errorBanner}>
+            ⚠ {connError}
+          </div>
+        )}
         <header style={styles.header}>
           <div style={styles.eyebrow}>DIARIO DI VIAGGIO</div>
           {nameEditing ? (
@@ -1093,6 +1123,11 @@ const styles = {
   emptyTitle: { fontWeight: 600, color: "#4B5563", marginBottom: 2 },
   emptyText: { fontSize: 12.5, maxWidth: 340 },
   footer: { textAlign: "center", fontSize: 11, color: "#A3A08F", marginTop: 24 },
+  errorBanner: {
+    background: "#FDECEA", border: "1px solid #E9A7A0", color: "#8C2F26",
+    borderRadius: 10, padding: "10px 12px", fontSize: 12, marginBottom: 14,
+    lineHeight: 1.5, wordBreak: "break-word",
+  },
   resetBtn: {
     display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
     width: "100%", marginTop: 10, padding: "11px", borderRadius: 10,
