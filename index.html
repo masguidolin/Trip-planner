@@ -69,7 +69,7 @@
   });
 </script>
 
-<script type="text/babel" data-presets="react">
+<script type="text/babel-source" id="app-source">
 const { useState, useEffect, useCallback } = React;
 
 // Icone SVG incorporate (nessuna libreria esterna necessaria)
@@ -1150,6 +1150,18 @@ const styles = {
 };
 
 ReactDOM.createRoot(document.getElementById("root")).render(<TripPlanner />);
+</script>
+<script>
+  // Trasforma manualmente il JSX con runtime "classico" (React.createElement),
+  // evitando il runtime automatico di Babel che richiede import di moduli
+  // non risolvibili in un semplice tag <script> nel browser.
+  (function () {
+    const source = document.getElementById("app-source").textContent;
+    const output = Babel.transform(source, {
+      presets: [["react", { runtime: "classic" }]],
+    }).code;
+    (0, eval)(output);
+  })();
 </script>
 </body>
 </html>
