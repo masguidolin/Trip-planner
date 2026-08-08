@@ -39,13 +39,18 @@
     appId: "1:796133832787:web:8cefc4fd4b59f48b9d6ea6"
   };
 
-  firebase.initializeApp(firebaseConfig);
-  const auth = firebase.auth();
-  const db = firebase.firestore();
+  window.__connDebug = { authError: null, authOk: false, initError: null };
+
+  let auth, db;
+  try {
+    firebase.initializeApp(firebaseConfig);
+    auth = firebase.auth();
+    db = firebase.firestore();
+  } catch (err) {
+    window.__connDebug.initError = (err && err.code ? err.code + ": " : "") + (err && err.message ? err.message : String(err));
+  }
 
   const DOC_REF = () => db.collection("tripplanner").doc("main");
-
-  window.__connDebug = { authError: null, authOk: false };
 
   // Storage adapter con la stessa interfaccia usata nell'artifact
   // (get/set su una singola chiave), ma sostenuta da Firestore.
@@ -236,10 +241,13 @@ function TripPlanner() {
   useEffect(() => {
     (async () => {
       try {
-        await window.__authReady;
+        const timeout = new Promise((_, rej) =>
+          setTimeout(() => rej(new Error("TIMEOUT: nessuna risposta dal server di autenticazione dopo 8 secondi. È probabile un blocco di rete (firewall, DNS a filtro, o un blocco della rete Wi-Fi/mobile) verso i domini Google di autenticazione.")), 8000)
+        );
+        await Promise.race([window.__authReady, timeout]);
         forceDebugRefresh((n) => n + 1);
       } catch (e) {
-        setConnError("Autenticazione Firebase fallita: " + (window.__connDebug.authError || e.message || String(e)));
+        setConnError((window.__connDebug.initError ? "Init: " + window.__connDebug.initError + " — " : "") + (window.__connDebug.authError || e.message || String(e)));
         setLoaded(true);
         return;
       }
