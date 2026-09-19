@@ -54,6 +54,15 @@
 
   // Storage adapter con la stessa interfaccia usata nell'artifact
   // (get/set su una singola chiave), ma sostenuta da Firestore.
+  //
+  // Rete di sicurezza: teniamo uno STORICO di backup (non un solo slot),
+  // in una sottocollezione con un documento per ogni salvataggio, così che
+  // anche più scritture "cattive" di fila (es. l'app riaperta più volte
+  // durante un problema di connessione) non cancellino anche l'ultima
+  // versione buona: restano comunque disponibili le versioni precedenti.
+  const BACKUPS_REF = () => DOC_REF().collection("backups");
+  const MAX_BACKUPS = 10;
+
   window.storage = {
     async get(key) {
       const snap = await DOC_REF().get();
@@ -63,36 +72,30 @@
       return { key, value: data[key], shared: false };
     },
     async set(key, value) {
+      try {
+        const prevSnap = await DOC_REF().get();
+        if (prevSnap.exists) {
+          const prevData = prevSnap.data();
+          if (prevData && key in prevData && prevData[key]) {
+            const now = Date.now();
+            await BACKUPS_REF()
+              .doc(String(now))
+              .set({ [key]: prevData[key], savedAt: now });
+
+            // Manteniamo solo le ultime MAX_BACKUPS versioni, per non
+            // accumulare dati all'infinito.
+            const old = await BACKUPS_REF().orderBy("savedAt", "desc").get();
+            const extra = old.docs.slice(MAX_BACKUPS);
+            await Promise.all(extra.map((d) => d.ref.delete()));
+          }
+        }
+      } catch (e) {
+        // Il backup è opportunistico: se fallisce non blocchiamo il salvataggio vero.
+      }
       await DOC_REF().set({ [key]: value }, { merge: true });
       return { key, value, shared: false };
     },
   };
-
-  // Test diretto via REST, senza passare dall'SDK Firebase: chiama l'endpoint
-  // di sign-up anonimo di Identity Toolkit e registra lo stato HTTP grezzo.
-  // Questo ci dice se il problema è nella rete/DNS (la fetch va in timeout)
-  // o è una risposta del server (es. 400 con un messaggio di errore preciso).
-  window.__connDebug.restTest = "in corso...";
-  (function () {
-    const url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" + firebaseConfig.apiKey;
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 8000);
-    fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ returnSecureToken: true }),
-      signal: controller.signal,
-    })
-      .then(async (res) => {
-        clearTimeout(t);
-        const text = await res.text();
-        window.__connDebug.restTest = "HTTP " + res.status + ": " + text.slice(0, 200);
-      })
-      .catch((err) => {
-        clearTimeout(t);
-        window.__connDebug.restTest = "FETCH FALLITA: " + (err && err.name ? err.name + " — " : "") + (err && err.message ? err.message : String(err));
-      });
-  })();
 
   window.__authReady = new Promise((resolve, reject) => {
     auth.onAuthStateChanged(
@@ -168,8 +171,12 @@ const emptyNightDraft = () => ({
   location: "",
   confirmation: "",
   pin: "",
-  paid: false,
-  cancelInfo: "",
+  price: "",
+  nonCancellable: false,
+  cancelUntil: "",
+  paymentType: "onsite", // "onsite" | "advance"
+  amountPaid: "",
+  notes: "",
   link: "",
   address: "",
 });
@@ -258,50 +265,57 @@ function TripPlanner() {
   const [nightDraft, setNightDraft] = useState(emptyNightDraft());
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleteInput, setDeleteInput] = useState("");
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importError, setImportError] = useState(null);
 
   const defaultNewDate = flightOut.date ? addDays(flightOut.date, 1) : "";
 
   const [connError, setConnError] = useState(null);
+  // IMPORTANTE: loadFailed resta true finché non abbiamo la CONFERMA di aver
+  // letto correttamente (anche se vuoto) il documento remoto. Finché è true,
+  // il salvataggio automatico resta disattivato: questo evita che un problema
+  // temporaneo di rete/autenticazione durante il caricamento venga scambiato
+  // per "nessun dato" e sovrascriva per sempre i dati reali già salvati.
+  const [loadFailed, setLoadFailed] = useState(false);
   const [, forceDebugRefresh] = useState(0);
 
-  useEffect(() => {
-    let count = 0;
-    const id = setInterval(() => {
-      count++;
+  const loadFromServer = useCallback(async () => {
+    setConnError(null);
+    setLoadFailed(false);
+    setLoaded(false);
+    try {
+      const timeout = new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("TIMEOUT: nessuna risposta dal server di autenticazione dopo 8 secondi. È probabile un blocco di rete (firewall, DNS a filtro, o un blocco della rete Wi-Fi/mobile) verso i domini Google di autenticazione.")), 8000)
+      );
+      await Promise.race([window.__authReady, timeout]);
       forceDebugRefresh((n) => n + 1);
-      if (count > 12) clearInterval(id);
-    }, 800);
-    return () => clearInterval(id);
+    } catch (e) {
+      setConnError((window.__connDebug.initError ? "Init: " + window.__connDebug.initError + " — " : "") + (window.__connDebug.authError || e.message || String(e)));
+      setLoadFailed(true);
+      return;
+    }
+    try {
+      const res = await window.storage.get(STORAGE_KEY, false);
+      if (res && res.value) {
+        const data = JSON.parse(res.value);
+        setTripName(data.tripName ?? "Il mio viaggio");
+        setFlightOut(data.flightOut ?? emptyFlight());
+        setFlightIn(data.flightIn ?? emptyFlight());
+        setItems(Array.isArray(data.items) ? data.items : []);
+      }
+      // Lettura riuscita (anche se non c'era ancora nulla salvato): solo ora
+      // è sicuro attivare il salvataggio automatico.
+      setLoaded(true);
+    } catch (e) {
+      setConnError("Errore di lettura da Firestore: " + (e.code ? e.code + " — " : "") + (e.message || String(e)));
+      setLoadFailed(true);
+    }
   }, []);
 
   useEffect(() => {
-    (async () => {
-      try {
-        const timeout = new Promise((_, rej) =>
-          setTimeout(() => rej(new Error("TIMEOUT: nessuna risposta dal server di autenticazione dopo 8 secondi. È probabile un blocco di rete (firewall, DNS a filtro, o un blocco della rete Wi-Fi/mobile) verso i domini Google di autenticazione.")), 8000)
-        );
-        await Promise.race([window.__authReady, timeout]);
-        forceDebugRefresh((n) => n + 1);
-      } catch (e) {
-        setConnError((window.__connDebug.initError ? "Init: " + window.__connDebug.initError + " — " : "") + (window.__connDebug.authError || e.message || String(e)));
-        setLoaded(true);
-        return;
-      }
-      try {
-        const res = await window.storage.get(STORAGE_KEY, false);
-        if (res && res.value) {
-          const data = JSON.parse(res.value);
-          setTripName(data.tripName ?? "Il mio viaggio");
-          setFlightOut(data.flightOut ?? emptyFlight());
-          setFlightIn(data.flightIn ?? emptyFlight());
-          setItems(Array.isArray(data.items) ? data.items : []);
-        }
-      } catch (e) {
-        setConnError("Errore di lettura da Firestore: " + (e.code ? e.code + " — " : "") + (e.message || String(e)));
-      } finally {
-        setLoaded(true);
-      }
-    })();
+    loadFromServer();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const persist = useCallback(async (next) => {
@@ -318,10 +332,14 @@ function TripPlanner() {
   }, []);
 
   useEffect(() => {
-    if (!loaded) return;
+    // Il salvataggio automatico parte SOLO dopo una lettura riuscita.
+    // Se il caricamento è fallito (loadFailed) non salviamo mai uno stato
+    // "vuoto di default": rischierebbe di cancellare dati reali già presenti
+    // sul server per colpa di un problema temporaneo di connessione.
+    if (!loaded || loadFailed) return;
     persist({ tripName, flightOut, flightIn, items });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tripName, flightOut, flightIn, items, loaded]);
+  }, [tripName, flightOut, flightIn, items, loaded, loadFailed]);
 
   function sortTime(item) {
     if (item.type === "night") return "99:99"; // il pernottamento chiude sempre la giornata
@@ -356,8 +374,12 @@ function TripPlanner() {
       location: d.location,
       confirmation: d.confirmation,
       pin: d.pin,
-      paid: d.paid,
-      cancelInfo: d.cancelInfo,
+      price: d.price,
+      nonCancellable: d.nonCancellable,
+      cancelUntil: d.cancelUntil,
+      paymentType: d.paymentType,
+      amountPaid: d.amountPaid,
+      notes: d.notes,
       link: d.link,
       address: d.address,
     }));
@@ -396,11 +418,13 @@ function TripPlanner() {
               <table class="meta">
                 ${item.confirmation ? `<tr><td>Conferma</td><td>${esc(item.confirmation)}</td></tr>` : ""}
                 ${item.pin ? `<tr><td>PIN</td><td>${esc(item.pin)}</td></tr>` : ""}
-                <tr><td>Pagato</td><td>${item.paid ? "Sì" : "No"}</td></tr>
-                ${item.cancelInfo ? `<tr><td>Cancellazione</td><td>${esc(item.cancelInfo)}</td></tr>` : ""}
+                ${item.price ? `<tr><td>Prezzo</td><td>${esc(item.price)}</td></tr>` : ""}
+                <tr><td>Pagamento</td><td>${item.paymentType === "advance" ? `Pagato in anticipo${item.amountPaid ? ` (${esc(item.amountPaid)})` : ""}` : "Da pagare in loco"}</td></tr>
+                <tr><td>Cancellazione</td><td>${item.nonCancellable ? "Non cancellabile" : (item.cancelUntil ? `Entro ${esc(fmtDate(item.cancelUntil))}` : "—")}</td></tr>
                 ${item.address ? `<tr><td>Indirizzo</td><td>${esc(item.address)}</td></tr>` : ""}
                 ${item.link ? `<tr><td>Link</td><td>${esc(item.link)}</td></tr>` : ""}
               </table>
+              ${item.notes ? `<div class="entry-notes">${esc(item.notes)}</div>` : ""}
             </div>
           </div>`;
       }
@@ -490,6 +514,97 @@ function TripPlanner() {
     setItems([]);
     setConfirmingDelete(false);
     setDeleteInput("");
+  }
+
+  // Importa un JSON preparato in chat (a partire da un'email di conferma
+  // volo/prenotazione) e lo trasforma in voci del viaggio. Formato atteso:
+  // { "flightOut": {...}, "flightIn": {...}, "items": [ {"type":"night","checkIn":"...","nights":2,...}, {"type":"activity",...}, {"type":"transport",...} ] }
+  // Tutti i campi sono opzionali: si può importare anche un solo volo, o una
+  // sola voce.
+  function importFromJSON() {
+    setImportError(null);
+    let data;
+    try {
+      data = JSON.parse(importText);
+    } catch (e) {
+      setImportError("JSON non valido: " + e.message);
+      return;
+    }
+    try {
+      const newItems = [];
+      (Array.isArray(data.items) ? data.items : []).forEach((it) => {
+        if (!it || !it.type) return;
+        if (it.type === "night") {
+          const { checkIn, nights, ...base } = emptyNightDraft();
+          const n = Math.max(1, Number(it.nights) || 1);
+          for (let i = 0; i < n; i++) {
+            newItems.push({
+              ...base,
+              ...it,
+              id: crypto.randomUUID(),
+              type: "night",
+              date: addDays(it.checkIn || defaultNewDate, i),
+            });
+          }
+        } else if (it.type === "activity") {
+          newItems.push({ ...emptyActivity(), ...it, id: crypto.randomUUID(), type: "activity" });
+        } else if (it.type === "transport") {
+          newItems.push({ ...emptyTransport(), ...it, id: crypto.randomUUID(), type: "transport" });
+        }
+      });
+
+      if (newItems.length === 0 && !data.flightOut && !data.flightIn) {
+        setImportError("Nessuna voce riconosciuta in questo JSON.");
+        return;
+      }
+
+      if (data.flightOut) setFlightOut((f) => ({ ...f, ...data.flightOut }));
+      if (data.flightIn) setFlightIn((f) => ({ ...f, ...data.flightIn }));
+      if (newItems.length > 0) setItems((prev) => [...prev, ...newItems]);
+
+      setImportOpen(false);
+      setImportText("");
+    } catch (e) {
+      setImportError("Errore durante l'importazione: " + (e.message || String(e)));
+    }
+  }
+
+  // Finché non abbiamo la conferma di una lettura riuscita dal server,
+  // mostriamo solo questa schermata: mai la lista (vuota di default), per
+  // non rischiare di far credere che i dati siano spariti o di farci
+  // aggiungere voci sopra a uno stato che verrebbe poi salvato per sbaglio.
+  if (!loaded) {
+    return (
+      <div style={styles.page}>
+        <div style={styles.wrap}>
+          <div style={{ textAlign: "center", padding: "60px 20px" }}>
+            {!loadFailed ? (
+              <div style={{ color: "#8A8371", fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>
+                Caricamento del viaggio…
+              </div>
+            ) : (
+              <>
+                <div style={styles.errorBanner}>⚠ {connError}</div>
+                <div style={{ marginTop: 16, color: "#8A8371", fontSize: 13, lineHeight: 1.5 }}>
+                  Non riesco a leggere i dati salvati. Per sicurezza NON procedo
+                  a mostrare o salvare un viaggio vuoto: riprova quando la
+                  connessione torna disponibile.
+                </div>
+                <button
+                  style={{ ...styles.doneBtn, margin: "20px auto 0" }}
+                  onClick={loadFromServer}
+                >
+                  <Check size={13} /> Riprova
+                </button>
+              </>
+            )}
+            <div style={styles.debugLine}>
+              debug — uid: {window.__connDebug?.uid || "nessuno"} · anon: {String(window.__connDebug?.isAnonymous)} · token: {window.__connDebug?.tokenOk === true ? "ok" : (window.__connDebug?.tokenError || "n/d")}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -669,11 +784,14 @@ function TripPlanner() {
         <div style={styles.footer}>Dati salvati automaticamente sul dispositivo</div>
         <div style={styles.debugLine}>
           debug — uid: {window.__connDebug?.uid || "nessuno"} · anon: {String(window.__connDebug?.isAnonymous)} · token: {window.__connDebug?.tokenOk === true ? "ok" : (window.__connDebug?.tokenError || "n/d")}
-          <br />rest: {window.__connDebug?.restTest || "n/d"}
         </div>
 
         <button style={styles.exportBtn} onClick={exportPdf}>
           <StickyNote size={13} /> Esporta PDF del viaggio
+        </button>
+
+        <button style={styles.exportBtn} onClick={() => { setImportOpen(true); setImportError(null); }}>
+          <Plus size={13} /> Importa da JSON (email/prenotazione)
         </button>
 
         {!confirmingDelete ? (
@@ -719,6 +837,43 @@ function TripPlanner() {
           setViewingId(null);
         }}
       />
+
+      {importOpen && (
+        <div style={styles.modalOverlay} onClick={() => setImportOpen(false)}>
+          <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHandle} />
+            <div style={styles.modalHeader}>
+              <div style={styles.modalHeaderLeft}>
+                <span style={styles.modalDate}>Importa da JSON</span>
+              </div>
+              <button style={styles.iconBtn} onClick={() => setImportOpen(false)} aria-label="Chiudi">
+                <X size={16} />
+              </button>
+            </div>
+            <div style={{ fontSize: 12.5, color: "#5B6472", marginBottom: 8, lineHeight: 1.5 }}>
+              Incolla qui il JSON preparato in chat a partire da un'email di
+              conferma (volo, hotel, treno...). Verranno aggiunte le voci
+              trovate senza toccare quelle già presenti.
+            </div>
+            <textarea
+              autoFocus
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              style={{ ...styles.textarea, minHeight: 160, fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}
+              placeholder='{"items":[{"type":"night","checkIn":"2026-12-20","nights":2,"hotel":"..."}]}'
+            />
+            {importError && (
+              <div style={{ ...styles.errorBanner, marginTop: 8 }}>⚠ {importError}</div>
+            )}
+            <div style={styles.formActions}>
+              <button style={styles.deleteBtn} onClick={() => setImportOpen(false)}>Annulla</button>
+              <button style={styles.doneBtn} onClick={importFromJSON} disabled={!importText.trim()}>
+                <Check size={13} /> Importa
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -818,16 +973,30 @@ function NightRow({ item, editing, onEdit, onView, onChange, onDelete }) {
 }
 
 function NightDetails({ item }) {
-  const hasMeta = item.confirmation || item.pin || item.cancelInfo || item.address || item.link;
-  if (!hasMeta) return null;
+  const cancelText = item.nonCancellable
+    ? "Non cancellabile"
+    : item.cancelUntil
+    ? `Entro ${fmtDate(item.cancelUntil)}`
+    : "—";
+  const paymentText =
+    item.paymentType === "advance"
+      ? `Anticipo${item.amountPaid ? ` — ${item.amountPaid}` : ""}`
+      : "Da pagare in loco";
   return (
     <div style={styles.details}>
       <div style={styles.metaGrid}>
         {item.confirmation && <MetaItem icon={<KeyRound size={12} />} label="Conferma" value={item.confirmation} mono />}
         {item.pin && <MetaItem icon={<KeyRound size={12} />} label="PIN" value={item.pin} mono />}
-        <MetaItem icon={<Wallet size={12} />} label="Pagato" value={item.paid ? "Sì" : "No"} />
-        {item.cancelInfo && <MetaItem icon={<Wallet size={12} />} label="Cancellazione" value={item.cancelInfo} />}
+        {item.price && <MetaItem icon={<Wallet size={12} />} label="Prezzo" value={item.price} />}
+        <MetaItem icon={<Wallet size={12} />} label="Pagamento" value={paymentText} />
+        <MetaItem icon={<Wallet size={12} />} label="Cancellazione" value={cancelText} />
       </div>
+      {item.notes && (
+        <div style={{ ...styles.noteBlock, background: "#EAF1F5", borderLeftColor: "#3D5A6C", color: "#274353" }}>
+          <StickyNote size={14} style={{ opacity: 0.6, flexShrink: 0, marginTop: 2 }} />
+          <span style={{ whiteSpace: "pre-wrap" }}>{item.notes}</span>
+        </div>
+      )}
       {item.address && (
         <div style={styles.addressRow}>
           <Navigation size={12} style={{ opacity: 0.5, flexShrink: 0, marginTop: 2 }} />
@@ -840,6 +1009,84 @@ function NightDetails({ item }) {
         </a>
       )}
     </div>
+  );
+}
+
+// Campi condivisi tra il form di aggiunta e quello di modifica di un
+// pernottamento: prezzo, cancellazione (entro una data o "non cancellabile")
+// e pagamento (in anticipo, con importo già versato, oppure in loco).
+function NightMoneyFields({ value, onChange }) {
+  const f = (key) => (e) => onChange({ [key]: e.target.value });
+  return (
+    <>
+      <Field label="Prezzo">
+        <input value={value.price} onChange={f("price")} style={styles.input} placeholder="es. 450€" />
+      </Field>
+      <Field label="Cancellazione">
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            onClick={() => onChange({ nonCancellable: !value.nonCancellable, cancelUntil: "" })}
+            style={{
+              ...styles.toggleBtn,
+              width: "auto",
+              padding: "7px 12px",
+              background: value.nonCancellable ? "#3D5A6C" : "transparent",
+              color: value.nonCancellable ? "#F7F5F0" : "#5B6472",
+            }}
+          >
+            Non cancellabile
+          </button>
+          {!value.nonCancellable && (
+            <input
+              type="date"
+              value={value.cancelUntil}
+              onChange={f("cancelUntil")}
+              style={{ ...styles.input, flex: 1, minWidth: 140 }}
+              placeholder="Cancellabile entro"
+            />
+          )}
+        </div>
+      </Field>
+      <Field label="Pagamento">
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            onClick={() => onChange({ paymentType: "advance" })}
+            style={{
+              ...styles.toggleBtn,
+              width: "auto",
+              padding: "7px 12px",
+              background: value.paymentType === "advance" ? "#3D5A6C" : "transparent",
+              color: value.paymentType === "advance" ? "#F7F5F0" : "#5B6472",
+            }}
+          >
+            Pagato in anticipo
+          </button>
+          <button
+            type="button"
+            onClick={() => onChange({ paymentType: "onsite" })}
+            style={{
+              ...styles.toggleBtn,
+              width: "auto",
+              padding: "7px 12px",
+              background: value.paymentType === "onsite" ? "#3D5A6C" : "transparent",
+              color: value.paymentType === "onsite" ? "#F7F5F0" : "#5B6472",
+            }}
+          >
+            Da pagare in loco
+          </button>
+          {value.paymentType === "advance" && (
+            <input
+              value={value.amountPaid}
+              onChange={f("amountPaid")}
+              style={{ ...styles.input, flex: 1, minWidth: 140 }}
+              placeholder="Quanto già pagato"
+            />
+          )}
+        </div>
+      </Field>
+    </>
   );
 }
 
@@ -864,20 +1111,10 @@ function NightEditForm({ item, onChange }) {
           <input value={item.pin} onChange={f("pin")} style={styles.input} />
         </Field>
       </div>
-      <div style={styles.formRow}>
-        <Field label="Pagato">
-          <button
-            type="button"
-            onClick={() => onChange({ paid: !item.paid })}
-            style={{ ...styles.toggleBtn, background: item.paid ? "#3D5A6C" : "transparent", color: item.paid ? "#F7F5F0" : "#5B6472" }}
-          >
-            {item.paid ? "Sì" : "No"}
-          </button>
-        </Field>
-        <Field label="Cancellazione / prezzo">
-          <input value={item.cancelInfo} onChange={f("cancelInfo")} style={styles.input} placeholder='es. "45530" o "no"' />
-        </Field>
-      </div>
+      <NightMoneyFields value={item} onChange={onChange} />
+      <Field label="Note">
+        <textarea value={item.notes} onChange={(e) => onChange({ notes: e.target.value })} style={styles.textarea} rows={3} placeholder="Dettagli, orari, idee…" />
+      </Field>
       <Field label="Link prenotazione">
         <input value={item.link} onChange={f("link")} style={styles.input} placeholder="https://…" />
       </Field>
@@ -1055,20 +1292,10 @@ function NightForm({ draft, onChange }) {
           <input value={draft.pin} onChange={f("pin")} style={styles.input} />
         </Field>
       </div>
-      <div style={styles.formRow}>
-        <Field label="Pagato">
-          <button
-            type="button"
-            onClick={() => onChange({ paid: !draft.paid })}
-            style={{ ...styles.toggleBtn, background: draft.paid ? "#3D5A6C" : "transparent", color: draft.paid ? "#F7F5F0" : "#5B6472" }}
-          >
-            {draft.paid ? "Sì" : "No"}
-          </button>
-        </Field>
-        <Field label="Cancellazione / prezzo">
-          <input value={draft.cancelInfo} onChange={f("cancelInfo")} style={styles.input} placeholder='es. "45530" o "no"' />
-        </Field>
-      </div>
+      <NightMoneyFields value={draft} onChange={onChange} />
+      <Field label="Note">
+        <textarea value={draft.notes} onChange={f("notes")} style={styles.textarea} rows={3} placeholder="Dettagli, orari, idee…" />
+      </Field>
       <Field label="Link prenotazione">
         <input value={draft.link} onChange={f("link")} style={styles.input} placeholder="https://…" />
       </Field>
